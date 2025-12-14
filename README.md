@@ -1,7 +1,6 @@
 # PHY51171_Projet-1.6_FARAJI_TANNOUS
 Neural networks for quantum systems
 
-# Neural Networks for Quantum Systems: 1D Ising Model
 
 ## Project description
 This project implements a Neural-Network Quantum State (NQS) ansatz using a **Restricted Boltzmann Machine (RBM)** to find the ground state of the **1D Transverse-Field Ising Model**.
