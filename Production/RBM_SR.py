@@ -1,0 +1,311 @@
+# We import librairies:
+
+import numpy as np
+import numpy.random as rnd
+import itertools
+import matplotlib.pyplot as plt
+from scipy.ndimage import convolve, generate_binary_structure
+from IPython import display
+import pandas as pd
+import time
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+from Design.Ising import Configuration
+from Exact_Energy import exact_1d_ising_energy, compute_relative_error
+
+
+class RBMSR:
+    """
+    Restricted Boltzmann Machine for 1D Ising model
+    Psi(S) = exp(sum_j a_j s_j) * prod_i 2*cosh(b_i + sum_j W_ij s_j)
+    """
+    def __init__(self, n_visible, n_hidden, seed=None):
+        """n_visible:   Number of visible units (physical spins in the system)
+        n_hidden:  Number of hidden units (hidden neurons defining correlations)
+        seed: Setting a seed makes all random initializations reproducible.
+        """
+        self.N = n_visible
+        self.M = n_hidden
+        self.alpha = n_hidden / n_visible  # Calculate alpha from n_hidden/n_visible
+
+        #Random number generator
+        self.rng = np.random.default_rng(seed)
+
+        # initialize parameters small
+        self.a = 0.01 * self.rng.normal(size=self.N)           # visible biases (shape N,)
+        self.b = 0.01 * self.rng.normal(size=self.M)           # hidden biases (shape M,)
+        self.W = 0.01 * self.rng.normal(size=(self.M, self.N)) # weights (M x N)  --> Weight matrix W_{ij} connecting visible spin j to hidden neuron i.
+
+    def psi(self, s):
+        """Wavefunction amplitude for configuration s"""
+        # linear visible term
+        v = np.dot(self.a, s)
+        term1=np.exp(v)
+
+        #hidden contributions
+        x = self.b + self.W @ s   # shape (M,)
+        term2=np.prod(2*np.cosh(x))
+        return term1*term2
+
+    def log_psi(self, s):
+        """Log of wavefunction amplitude"""
+        visible_term = np.dot(self.a, s)
+        x = self.b + self.W @ s
+        hidden_term = np.sum(np.log(2 * np.cosh(x)))
+
+        return visible_term + hidden_term
+
+    def log_psi_derivs(self, s):
+        """
+        Log-derivatives d ln psi / d param for a single configuration s.
+        Returns dict of arrays for a, b, W (same shapes).
+
+        d ln psi / d a_j = s_j
+        d ln psi / d b_i = tanh(b_i + sum_j W_ij s_j)
+        d ln psi / d W_ij = s_j * tanh(...)
+        """
+        x = self.b + self.W @ s            # shape (M,)
+        th = np.tanh(x)                    # shape (M,)
+        da = s.copy()                      # shape (N,)
+        db = th.copy()                     # shape (M,)
+        dW = np.outer(th, s)               # shape (M, N)
+        return da, db, dW
+
+    def get_log_psi_ratio(self, sigma, i):
+        """
+    Computes the ratio R_i = Ψ_RBM(sigma^(i)) / Ψ_RBM(sigma),
+    where sigma^(i) is the configuration obtained by flipping spin i.
+
+    This ratio is used in Variational Monte Carlo to evaluate the effect
+    of a single spin flip on the RBM wavefunction, without recomputing
+    the full wavefunction from scratch.
+    """
+
+        # Original value of spin i
+        sigma_i_initial = sigma[i]
+
+        # Flipped value of spin i: s_i → -s_i
+        sigma_i_flipped = -sigma_i_initial
+
+        # Contribution of the visible bias term to the log-wavefunction difference:
+        diff_log_term_v = self.a[i] * (-2 * sigma_i_initial)
+
+        # Change in the hidden-unit pre-activation values:
+        Delta_h_j = self.W[:, i] * (-2 * sigma_i_initial)
+
+        # Initial hidden pre-activation values h_j(sigma)
+        h_initial = self.b + self.W @ sigma
+
+        # Hidden pre-activation values after flipping spin i
+        h_flipped = h_initial + Delta_h_j
+
+        # Contribution of hidden units to the log-wavefunction difference:
+        diff_log_term_h = np.sum(np.log(np.cosh(h_flipped)) - np.log(np.cosh(h_initial)))
+
+        # Total log-ratio: log(Ψ(sigma^(i))) - log(Ψ(sigma))
+        log_ratio = diff_log_term_v + diff_log_term_h
+        return np.exp(log_ratio)
+
+
+    def get_energy_local(self, config):
+        """
+    Computes the local energy E_L(sigma) = <sigma|H|Ψ> / <sigma|Ψ>
+    for the transverse-field Ising Hamiltonian:
+
+        H = -J Σ_i s_i s_{i+1}  -  H Σ_i σ_i^x
+
+    The local energy has:
+        • a diagonal term (interaction energy in the z basis)
+        • a non-diagonal term involving spin flips (transverse field H)
+    """
+
+        N = self.N                 # Number of spins
+        sigma = config.spins       # Current spin configuration
+        # 1. Diagonal part: classical Ising interaction energy E_classical = -J Σ_i s_i s_{i+1}
+        # Periodic boundary conditions: s_N couples with s_1
+
+        # Sum over neighbors: s_1*s_2 + ... + s_{N-1}*s_N
+        interaction_sum = np.sum(sigma[:-1] * sigma[1:])
+
+        # Add periodic interaction: s_N * s_1
+        interaction_sum += sigma[-1] * sigma[0]
+
+        # Classical contribution
+        E_classique = -config.J * interaction_sum
+
+        # 2. Non-diagonal part: transverse-field flip contributions
+        # Each term σ_i^x induces a spin flip at site i.
+        # The contribution is proportional to Ψ(sigma^(i)) / Ψ(sigma)
+
+        sum_of_ratios = 0.0 + 0.0j   # Allow complex-valued wavefunctions
+
+        for i in range(N):
+        # Compute the wavefunction ratio for flipping spin i
+            ratio_i = self.get_log_psi_ratio(sigma, i)
+            sum_of_ratios += ratio_i
+
+        # Transverse-field contribution
+        E_non_diag = -config.H * sum_of_ratios
+
+        # 3. Total local energy
+        E_local = E_classique + E_non_diag
+        return E_local
+
+
+
+    def local_energy(self, config):
+        """
+        Local energy using existing Configuration class
+        """
+        return self.get_energy_local(config)
+
+
+    def metropolis_step(self, config):
+        """Single Metropolis-Hastings step using |psi|^2"""
+        # Create a copy to test spin flip
+        new_config = Configuration(config.length, config.T, config.J, config.H)
+        new_config.spins = config.spins.copy()
+
+        # Flip a random spin
+        i = self.rng.integers(config.length)
+        new_config.spins[i] *= -1
+
+        # Acceptance probability: |psi(new)|^2 / |psi(old)|^2
+        log_p_accept = 2 * (self.log_psi(new_config.spins) - self.log_psi(config.spins))
+
+        if log_p_accept >= 0 or self.rng.random() < np.exp(log_p_accept):
+            config.spins = new_config.spins.copy()
+            return True
+        return False
+
+
+    def sample(self, n_samples, n_burnin=1000, T=1e-10, J=1.0, H=0.0):
+        """Generate samples using Metropolis-Hastings from |psi|^2 (proba of distribution)"""
+        # Initialize configuration
+        config = Configuration(self.N, T, J, H)
+        config.spins = self.rng.choice([-1, 1], size=self.N)
+
+        # Burn-in phase: the system will forgot its initial configuration and converge to the distribtion target |psi|^2
+        for _ in range(n_burnin):
+            self.metropolis_step(config)
+
+        # Sampling phase
+        samples = []
+        energies = []
+        acceptances = 0
+        total_steps = 0
+
+        while len(samples) < n_samples:
+            accepted = self.metropolis_step(config)
+            if accepted:
+                samples.append(config.spins.copy())
+                energies.append(self.get_energy_local(config))
+            acceptances += int(accepted)
+            total_steps += 1
+
+        acceptance_rate = acceptances / total_steps
+        return np.array(samples), np.array(energies), acceptance_rate
+
+
+
+
+
+    def compute_gradients(self, samples, J=1.0, H=0.0):
+        n_samples = len(samples)
+    # Initialize accumulators
+        da_avg = np.zeros_like(self.a)
+        db_avg = np.zeros_like(self.b)
+        dW_avg = np.zeros_like(self.W)
+
+        E_local_list = []  # collect scalar energies
+        O_list = []        # collect concatenated derivatives
+
+    # Temporary configuration for energy evaluation
+        temp_config = Configuration(self.N, 1.0, J, H)
+
+        for spins in samples:
+            temp_config.spins = spins
+            E_local = float(self.local_energy(temp_config))  # ensure scalar
+            da, db, dW = self.log_psi_derivs(spins)
+
+        # Accumulate averages
+            da_avg += da
+            db_avg += db
+            dW_avg += dW
+
+            E_local_list.append(E_local)
+            O_list.append(np.concatenate([da, db, dW.flatten()]))
+
+    # Convert lists to arrays for vectorized mean
+        E_local_array = np.array(E_local_list)  # shape (n_samples,)
+        O_array = np.array(O_list)              # shape (n_samples, N+M+M*N)
+
+    # Averages
+        E_local_avg = np.mean(E_local_array)
+        O_avg = np.mean(O_array, axis=0)
+
+    # Compute gradients using covariance formula
+        # raw gradient (force) g = 2 * < (E_L - <E_L>) (O - <O>) >
+        grad = 2 * np.mean((E_local_array[:, None] - E_local_avg) * (O_array - O_avg), axis=0)
+
+        # Build the covariance matrix S = < (O - <O>) (O - <O>)^T >
+        # use a numerically stable vectorized expression
+        O_centered = O_array - O_avg[None, :]                     # shape (n_samples, P)
+        P = self.M + self.N + self.N * self.M                     # total number of parameters
+        # S shape (P,P)
+        S = (O_centered.T @ O_centered) / n_samples
+
+        # Regularization to ensure S is invertible
+        lam = 1e-3
+        S += lam * np.eye(P)
+
+        # Solve S * x = grad  (do not invert S explicitly)
+        try:
+            grad_S = np.linalg.solve(S, grad)
+        except np.linalg.LinAlgError:
+            # fallback to least squares if S is singular (very rare with regularization)
+            grad_S, *_ = np.linalg.lstsq(S, grad, rcond=None)
+
+    # Split gradients into a, b, W (grad_S is the SR update direction delta = S^{-1} g)
+        idx = 0
+        grad_a = grad_S[idx:idx + self.N]
+        idx += self.N
+        grad_b = grad_S[idx:idx + self.M]
+        idx += self.M
+        grad_W = grad_S[idx:idx + self.M * self.N].reshape(self.M, self.N)
+
+        return grad_a, grad_b, grad_W, E_local_avg
+
+
+# The training of our model :
+    def train(self, n_epochs, n_samples_per_epoch=1000, learning_rate=0.01, J=1.0, H=0.0, verbose=True):
+        """Train the RBM using Stochastic Reconfiguration"""
+        energies = []
+        rel_errors = []
+
+        #E_exact = exact_1d_ising_energy(self.N, J, H)
+        E_exact = exact_1d_ising_energy(self.N, J, H)[0]
+
+
+        for epoch in range(n_epochs):
+            # Generate samples from current wavefunction
+            samples, sample_energies, acceptance_rate = self.sample(n_samples_per_epoch, J=J, H=H)
+
+            # Compute gradients and energy (here grad_* are actually the SR update direction: delta = S^{-1} g)
+            grad_a, grad_b, grad_W, energy = self.compute_gradients(samples, J, H)
+            # Update parameters using SR update direction
+            self.a -= learning_rate * grad_a
+            self.b -= learning_rate * grad_b
+            self.W -= learning_rate * grad_W
+
+            # Compute relative error
+            rel_error = compute_relative_error(energy, E_exact)
+
+            energies.append(energy)
+            rel_errors.append(rel_error)
+
+            if verbose and (epoch % 10 == 0 or epoch == n_epochs - 1):
+                print(f"Epoch {epoch:3d}: E_NQS = {energy:8.4f}, "f"E_exact = {E_exact:8.4f}, "f"ε_rel = {rel_error:8.6f}, ", f"Accept = {acceptance_rate:.3f}")
+
+        return energies, rel_errors
